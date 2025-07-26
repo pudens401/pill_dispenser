@@ -5,11 +5,16 @@
 #include <RTClib.h>
 #include <LiquidCrystal_I2C.h>
 #include <Stepper.h>
-#include <ArduinoOTA.h> // OTA support
+#include <ArduinoOTA.h>
+#include <ArduinoJson.h>
+#include <FS.h>
+#include <WiFiClientSecureBearSSL.h>
+#include <ESP8266HTTPClient.h>
 
 // WiFi config
 const char* SSID_AP = "Pill dispenser";
 const char* PASS_AP = "12345678";
+String deviceId = "PD01";
 const uint16_t WIFI_TIMEOUT = 10000;
 const size_t EEPROM_SIZE = 128;
 ESP8266WebServer server(80);
@@ -36,15 +41,135 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 Stepper stepper(STEPS_PER_REV, IN1, IN3, IN2, IN4);
 
 // Scheduling
-const int presetHours[] = {22, 22, 22};
-const int presetMinutes[] = {38, 39, 40};
-const int scheduleCount = sizeof(presetHours) / sizeof(presetHours[0]);
-bool alreadyExecuted[scheduleCount] = {false};
+int scheduleHours[6];
+int scheduleMinutes[6];
+int scheduleCount = 0;
+bool alreadyExecuted[6] = {false};
 
 // Mode management
 bool refillMode = false;
 unsigned long buttonPressStart = 0;
 bool buttonHeld = false;
+
+// API endpoint
+const char* API_URL = "https://smart-scheduler-s5q7.onrender.com/schedule/PD01";
+
+// --------- SPIFFS functions ----------
+bool saveScheduleToSPIFFS() {
+  File file = SPIFFS.open("/schedule.json", "w");
+  if (!file) {
+    Serial.println("Failed to open schedule.json for writing");
+    return false;
+  }
+
+  StaticJsonDocument<256> doc;
+  JsonArray times = doc.createNestedArray("times");
+  for (int i = 0; i < scheduleCount; i++) {
+    char buf[6];
+    sprintf(buf, "%02d:%02d", scheduleHours[i], scheduleMinutes[i]);
+    times.add(buf);
+  }
+
+  if (serializeJson(doc, file) == 0) {
+    Serial.println("Failed to write JSON");
+    file.close();
+    return false;
+  }
+  file.close();
+  Serial.println("Schedule saved to SPIFFS");
+  return true;
+}
+
+bool loadScheduleFromSPIFFS() {
+  if (!SPIFFS.exists("/schedule.json")) {
+    Serial.println("No schedule file found");
+    return false;
+  }
+
+  File file = SPIFFS.open("/schedule.json", "r");
+  if (!file) {
+    Serial.println("Failed to open schedule.json");
+    return false;
+  }
+
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  if (error) {
+    Serial.println("Failed to parse schedule JSON from SPIFFS");
+    return false;
+  }
+
+  JsonArray times = doc["times"];
+  scheduleCount = 0;
+  for (JsonVariant v : times) {
+    String t = v.as<String>();
+    int hour = t.substring(0, 2).toInt();
+    int minute = t.substring(3, 5).toInt();
+    scheduleHours[scheduleCount] = hour;
+    scheduleMinutes[scheduleCount] = minute;
+    alreadyExecuted[scheduleCount] = false;
+    scheduleCount++;
+    if (scheduleCount >= 6) break;
+  }
+  Serial.println("Schedule loaded from SPIFFS");
+  return true;
+}
+
+// --------- API fetch ----------
+bool fetchScheduleFromAPI() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure();
+
+  HTTPClient https;
+  if (!https.begin(*client, API_URL)) {
+    Serial.println("HTTPS begin failed");
+    return false;
+  }
+
+  int httpCode = https.GET();
+  Serial.println("Sending GET request");
+
+  if (httpCode > 0) {
+    Serial.printf("HTTP code: %d\n", httpCode);
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = https.getString();
+      Serial.println(payload);
+
+      StaticJsonDocument<512> doc;
+      DeserializationError error = deserializeJson(doc, payload);
+      if (error) {
+        Serial.println("JSON parse failed");
+        https.end();
+        return false;
+      }
+
+      JsonArray timesArray = doc["times"];
+      scheduleCount = 0;
+      for (JsonVariant t : timesArray) {
+        String timeStr = t["time"].as<String>();
+        int hour = timeStr.substring(0, 2).toInt();
+        int minute = timeStr.substring(3, 5).toInt();
+        scheduleHours[scheduleCount] = hour;
+        scheduleMinutes[scheduleCount] = minute;
+        alreadyExecuted[scheduleCount] = false;
+        scheduleCount++;
+        if (scheduleCount >= 6) break;
+      }
+
+      saveScheduleToSPIFFS();
+      https.end();
+      return true;
+    }
+  } else {
+    Serial.printf("HTTPS GET failed, error: %s\n", https.errorToString(httpCode).c_str());
+  }
+
+  https.end();
+  return false;
+}
 
 // EEPROM functions
 bool saveWiFiCredentials(const String& ssid, const String& pass) {
@@ -142,6 +267,11 @@ void setup() {
     while (1);
   }
 
+  // Initialize SPIFFS
+  if (!SPIFFS.begin()) {
+    Serial.println("SPIFFS init failed");
+  }
+
   lcd.setCursor(0, 0);
   lcd.print("Connecting WiFi...");
   delay(1000);
@@ -150,31 +280,25 @@ void setup() {
     lcd.clear();
     lcd.print("AP Mode Start");
     startAPMode();
+    loadScheduleFromSPIFFS(); // fallback to offline
   } else {
     lcd.clear();
     lcd.print("WiFi connected!");
     delay(1000);
 
+    // Fetch schedule from API
+    lcd.clear();
+    lcd.print("Fetching from net");
+    delay(1000);
+    if (!fetchScheduleFromAPI()) {
+      loadScheduleFromSPIFFS();
+      lcd.clear();
+      lcd.print("Loaded local data");
+      delay(1000);
+    }
+
     // Initialize OTA
     ArduinoOTA.setHostname("PillDispenser");
-    ArduinoOTA.onStart([]() {
-      String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
-      Serial.println("Start updating " + type);
-    });
-    ArduinoOTA.onEnd([]() {
-      Serial.println("\nUpdate complete");
-    });
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-    });
-    ArduinoOTA.onError([](ota_error_t error) {
-      Serial.printf("Error[%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-      else if (error == OTA_END_ERROR) Serial.println("End Failed");
-    });
     ArduinoOTA.begin();
     Serial.println("OTA Ready");
   }
@@ -234,7 +358,7 @@ void loop() {
   // Normal mode: run schedule logic
   if (!refillMode) {
     for (int i = 0; i < scheduleCount; i++) {
-      if (now.hour() == presetHours[i] && now.minute() == presetMinutes[i]) {
+      if (now.hour() == scheduleHours[i] && now.minute() == scheduleMinutes[i]) {
         if (!alreadyExecuted[i]) {
           stepper.step((int)DEGREE_TO_STEP);
           playBuzzer(1000);
