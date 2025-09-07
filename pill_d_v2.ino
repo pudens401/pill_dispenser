@@ -14,7 +14,7 @@
 // WiFi config
 const char* SSID_AP = "Pill dispenser";
 const char* PASS_AP = "12345678";
-String deviceId = "PD01";
+String deviceId = "PD02";
 const uint16_t WIFI_TIMEOUT = 10000;
 const size_t EEPROM_SIZE = 128;
 ESP8266WebServer server(80);
@@ -52,7 +52,7 @@ unsigned long buttonPressStart = 0;
 bool buttonHeld = false;
 
 // API endpoint
-const char* API_URL = "https://smart-scheduler-s5q7.onrender.com/schedule/PD01";
+const char* API_URL = "https://smart-scheduler-s5q7.onrender.com/schedule/PD02";
 
 // --------- SPIFFS functions ----------
 bool saveScheduleToSPIFFS() {
@@ -266,6 +266,10 @@ void setup() {
     lcd.print("RTC error");
     while (1);
   }
+
+  // Only set RTC time once at compile/upload
+  //rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
 
   // Initialize SPIFFS
   if (!SPIFFS.begin()) {
